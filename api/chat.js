@@ -3,22 +3,13 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Clean the key: strips quotes/spaces in case it was pasted badly
   const KEY = (process.env.GROQ_API_KEY || "").replace(/["' ]/g, "").trim();
   if (!KEY.startsWith("gsk_")) {
-    return res.status(500).json({
-      error: "Server problem: GROQ_API_KEY is missing or malformed. Set it in Vercel → Settings → Environment Variables, then REDEPLOY."
-    });
+    return res.status(500).json({ error: "GROQ_API_KEY missing on server. Set it in Vercel → Settings → Environment Variables, then redeploy." });
   }
 
-  // Clean the model string: replaces fancy hyphens with real ones
-  const MODEL = "llama-3.1-8b-instant".replace(/[\u2010-\u2015\u2212]/g, "-").trim();
-
-  // Read incoming messages safely
   let body = req.body;
-  if (typeof body === "string") {
-    try { body = JSON.parse(body); } catch { body = {}; }
-  }
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
   const messages = Array.isArray(body.messages) ? body.messages : [];
 
   const facts = [
@@ -49,44 +40,60 @@ export default async function handler(req, res) {
   ];
   const systemPrompt = facts.join(" ");
 
-  let response;
+  // STEP 1 — ask Groq which models this key can actually use, right now
+  let available = [];
   try {
-    response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    const r = await fetch("https://api.groq.com/openai/v1/models", {
+      headers: { "Authorization": "Bearer " + KEY }
+    });
+    const j = await r.json();
+    if (r.ok) available = (j.data || []).map(m => m.id);
+  } catch {}
+
+  if (available.length === 0) {
+    return res.status(502).json({ error: "Could not list models for this key. Check it is still active at console.groq.com." });
+  }
+
+  // STEP 2 — pick the best available model (never a dead one)
+  const PREFERRED = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "qwen/qwen3-32b"
+  ];
+  const model = PREFERRED.find(m => available.includes(m))
+    || available.find(id => /llama|gpt|qwen|kimi|glm|deepseek/i.test(id))
+    || available[0];
+
+  // STEP 3 — call it
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": "Bearer " + KEY
       },
       body: JSON.stringify({
-        model: MODEL,
+        model: model,
         messages: [{ role: "system", content: systemPrompt }].concat(messages),
         max_tokens: 1024,
         temperature: 0.7
       })
     });
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: raw, debug: { chosen_model: model, available: available } });
+    }
+
+    const data = JSON.parse(raw);
+    const reply = data.choices[0].message.content;
+    return res.status(200).json({ reply: reply, model_used: model });
+
   } catch (err) {
-    return res.status(502).json({ error: "Could not reach Groq: " + err.message });
+    return res.status(500).json({ error: err.message });
   }
-
-  // Read the RAW response so Groq's exact answer is never hidden from us
-  const raw = await response.text();
-
-  if (!response.ok) {
-    return res.status(response.status).json({
-      error: raw,
-      debug: { model_sent: MODEL, upstream_status: response.status }
-    });
-  }
-
-  let data;
-  try { data = JSON.parse(raw); } catch {
-    return res.status(502).json({ error: "Groq sent non-JSON: " + raw.slice(0, 300) });
-  }
-
-  const reply = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!reply) {
-    return res.status(502).json({ error: "Unexpected Groq response: " + raw.slice(0, 300) });
-  }
-
-  return res.status(200).json({ reply: reply });
 }
